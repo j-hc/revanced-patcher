@@ -1,5 +1,6 @@
 package app.revanced.patcher
 
+import app.revanced.patcher.data.PackageMetadata
 import app.revanced.patcher.util.dex.DexFile
 import java.io.File
 
@@ -12,5 +13,7 @@ import java.io.File
 data class PatcherResult(
     val dexFiles: List<DexFile>,
     val doNotCompress: List<String>? = null,
-    val resourceFile: File?
+    val resourceFile: File?,
+    val packageMetadata: PackageMetadata,
+    val file: File
 )

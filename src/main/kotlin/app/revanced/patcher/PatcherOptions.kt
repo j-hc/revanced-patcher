@@ -15,6 +15,7 @@ import java.io.File
  */
 data class PatcherOptions(
     internal val inputFile: File,
+    internal val inputResourceFiles: List<File>,
     internal val resourceCacheDirectory: String,
     internal val patchResources: Boolean = false,
     internal val aaptPath: String = "",
