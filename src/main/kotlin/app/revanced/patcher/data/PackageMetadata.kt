@@ -7,7 +7,7 @@ import brut.androlib.meta.MetaInfo
  */
 class PackageMetadata {
     lateinit var packageName: String
-    lateinit var packageVersion: String
+    var packageVersion: String? = null
 
     internal val metaInfo: MetaInfo = MetaInfo()
 }

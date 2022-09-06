@@ -19,6 +19,7 @@ import brut.androlib.meta.UsesFramework
 import brut.androlib.options.BuildOptions
 import brut.androlib.res.AndrolibResources
 import brut.androlib.res.data.ResPackage
+import brut.androlib.res.data.ResTable
 import brut.androlib.res.decoder.AXmlResourceParser
 import brut.androlib.res.decoder.ResAttrDecoder
 import brut.androlib.res.decoder.XmlPullStreamDecoder
@@ -43,7 +44,7 @@ val NAMER = BasicDexFileNamer()
  */
 class Patcher(private val options: PatcherOptions) {
     private val logger = options.logger
-    private val opcodes: Opcodes
+    private val opcodes: Opcodes?
 
     val data: PatcherData
 
@@ -58,16 +59,28 @@ class Patcher(private val options: PatcherOptions) {
             outDir.mkdirs()
 
             val androlib = Androlib(BuildOptions().also { it.setBuildOptions(options) })
-            val resourceTable = androlib.getResTable(extInputFile, true)
+            var resourceTable: ResTable
+            try {
+                resourceTable = androlib.getResTable(extInputFile, true)
+            } catch (e: Exception) {
+                resourceTable = androlib.getResTable(extInputFile, false)
+                logger.warn("No package was loaded: $e")
+            }
 
             val packageMetadata = PackageMetadata()
-
+            var resourcesDecoded = false
             if (options.patchResources) {
                 logger.info("Decoding resources")
 
-                // decode resources to cache directory
-                androlib.decodeManifestWithResources(extInputFile, outDir, resourceTable)
-                androlib.decodeResourcesFull(extInputFile, outDir, resourceTable)
+                try {
+                    // decode resources to cache directory
+                    androlib.decodeManifestWithResources(extInputFile, outDir, resourceTable)
+                    androlib.decodeResourcesFull(extInputFile, outDir, resourceTable)
+                    resourcesDecoded = true
+                } catch (_e: Exception) {
+                    logger.warn("Decoding resources failed. Only the manifest will be decoded.")
+                    androlib.decodeManifestFull(extInputFile, outDir, resourceTable)
+                }
 
                 // read additional metadata from the resource table
                 packageMetadata.metaInfo.usesFramework = UsesFramework().also { framework ->
@@ -98,22 +111,40 @@ class Patcher(private val options: PatcherOptions) {
                 )
             }
 
-            packageMetadata.packageName = resourceTable.currentResPackage.name
+            if (resourcesDecoded) {
+                packageMetadata.packageName = resourceTable.currentResPackage.name
+            } else {
+                packageMetadata.packageName = resourceTable.packageRenamed
+                packageMetadata.metaInfo.doNotCompress = null
+            }
             packageMetadata.packageVersion = resourceTable.versionInfo.versionName
             packageMetadata.metaInfo.versionInfo = resourceTable.versionInfo
             packageMetadata.metaInfo.sdkInfo = resourceTable.sdkInfo
 
             logger.info("Reading dex files")
 
-            // read dex files
-            val dexFile = MultiDexIO.readDexFile(true, options.inputFile, NAMER, null, null)
-            // get the opcodes
-            opcodes = dexFile.opcodes
+            var dexFile: DexFile? = null
+            try {
+                // read dex files
+                dexFile = MultiDexIO.readDexFile(true, options.inputFile, NAMER, null, null)
+            } catch (_e: Exception) {
+                logger.warn("Could not read dex files")
+            }
+
+            val internalClasses = if (dexFile != null) {
+                // get the opcodes
+                opcodes = dexFile.opcodes
+                dexFile.classes.toMutableList()
+            } else {
+                opcodes = null
+                mutableListOf()
+            }
 
             // finally create patcher data
             data = PatcherData(
-                dexFile.classes.toMutableList(), options.resourceCacheDirectory, packageMetadata
+                internalClasses, options.resourceCacheDirectory, packageMetadata
             )
+
         } finally {
             extInputFile.close()
         }
@@ -193,7 +224,7 @@ class Patcher(private val options: PatcherOptions) {
                 // delete if it exists
                 Files.deleteIfExists(aaptFile.toPath())
 
-                val resDirectory = cacheDirectory.resolve("res")
+                val resDirectory = cacheDirectory.resolve("res").let { if (it.exists()) it else null }
                 val includedFiles = metaInfo.usesFramework.ids.map { id ->
                     androlibResources.getFrameworkApk(
                         id, metaInfo.usesFramework.tag
@@ -212,30 +243,33 @@ class Patcher(private val options: PatcherOptions) {
         }
 
         logger.trace("Creating new dex file")
-        val newDexFile = object : DexFile {
-            override fun getClasses(): Set<ClassDef> {
-                data.bytecodeData.classes.applyProxies()
-                return ListBackedSet(data.bytecodeData.classes.internalClasses)
+        val dexFiles = if (opcodes != null) {
+            val newDexFile = object : DexFile {
+                override fun getClasses(): Set<ClassDef> {
+                    data.bytecodeData.classes.applyProxies()
+                    return ListBackedSet(data.bytecodeData.classes.internalClasses)
+                }
+
+                override fun getOpcodes(): Opcodes {
+                    return this@Patcher.opcodes
+                }
             }
 
-            override fun getOpcodes(): Opcodes {
-                return this@Patcher.opcodes
-            }
-        }
-
-        // write modified dex files
-        logger.info("Writing modified dex files")
-        val dexFiles = mutableMapOf<String, MemoryDataStore>()
-        MultiDexIO.writeDexFile(
-            true, -1, // core count
-            dexFiles, NAMER, newDexFile, DexIO.DEFAULT_MAX_DEX_POOL_SIZE, null
-        )
-
-        return PatcherResult(
+            // write modified dex files
+            logger.info("Writing modified dex files")
+            val dexFiles = mutableMapOf<String, MemoryDataStore>()
+            MultiDexIO.writeDexFile(
+                true, -1, // core count
+                dexFiles, NAMER, newDexFile, DexIO.DEFAULT_MAX_DEX_POOL_SIZE, null
+            )
             dexFiles.map {
                 app.revanced.patcher.util.dex.DexFile(it.key, it.value.readAt(0))
-            }, metaInfo.doNotCompress?.toList(), resourceFile
-        )
+            }
+        } else {
+            listOf()
+        }
+
+        return PatcherResult(dexFiles, metaInfo.doNotCompress?.toList(), resourceFile)
     }
 
     /**
@@ -294,7 +328,10 @@ class Patcher(private val options: PatcherOptions) {
             data.resourceData
         } else {
             val bytecodeData = data.bytecodeData
-            (patchInstance as BytecodePatch).fingerprints?.resolve(bytecodeData, bytecodeData.classes.internalClasses)
+            (patchInstance as BytecodePatch).fingerprints?.resolve(
+                bytecodeData,
+                bytecodeData.classes.internalClasses
+            )
             bytecodeData
         }
 
